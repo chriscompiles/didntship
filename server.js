@@ -146,6 +146,7 @@ app.post("/checkout", async (req, res) => {
       mode: "payment",
       success_url: `${PUBLIC_URL}/?paid=1`,
       cancel_url: `${PUBLIC_URL}/?cancel=1`,
+      managed_payments: { enabled: false },
       metadata: {
         body,
         handle: handle || "",
