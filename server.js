@@ -181,24 +181,38 @@ function renderPage(totalPence, pinned, rows) {
         ? `<span class="handle">@${escapeHtml(row.handle)}</span>`
         : "";
       const link = row.link
-        ? `<a class="link" href="${escapeHtml(row.link)}" rel="nofollow noopener" target="_blank">link</a>`
+        ? `<a class="link" href="${escapeHtml(row.link)}" rel="nofollow noopener" target="_blank">link <span aria-hidden="true">↗</span></a>`
         : "";
       const livePin =
         row.pinned_until && new Date(row.pinned_until) > new Date()
           ? `<span class="badge">pinned</span>`
           : "";
-      return `<li>
-        <p>${escapeHtml(row.body)}</p>
-        <div class="meta">${handle} ${link} ${livePin} <span>${pounds(row.amount_pence)}</span></div>
+      return `<li class="feed-item">
+        <article class="admission">
+          <p class="admission-body">${escapeHtml(row.body)}</p>
+          <div class="meta">
+            <div class="meta-person">${handle} ${link}</div>
+            <div class="meta-receipt">${livePin} <span class="amount">${pounds(row.amount_pence)}</span></div>
+          </div>
+        </article>
       </li>`;
     })
     .join("");
 
   const pinnedBlock = pinned
-    ? `<section class="pinned">
-        <div class="eyebrow">Currently pinned</div>
-        <p>${escapeHtml(pinned.body)}</p>
-        <div class="meta">${pinned.handle ? "@" + escapeHtml(pinned.handle) : ""} ${pounds(pinned.amount_pence)}</div>
+    ? `<section class="pinned" aria-labelledby="pinned-title">
+        <header class="pinned-header">
+          <p class="eyebrow">Currently pinned</p>
+          <span class="badge badge-inverse">top of the wall</span>
+        </header>
+        <h2 id="pinned-title">${escapeHtml(pinned.body)}</h2>
+        <div class="meta pinned-meta">
+          <div class="meta-person">
+            ${pinned.handle ? `<span class="handle">@${escapeHtml(pinned.handle)}</span>` : ""}
+            ${pinned.link ? `<a class="link" href="${escapeHtml(pinned.link)}" rel="nofollow noopener" target="_blank">link <span aria-hidden="true">↗</span></a>` : ""}
+          </div>
+          <span class="amount">${pounds(pinned.amount_pence)}</span>
+        </div>
       </section>`
     : "";
 
@@ -208,36 +222,68 @@ function renderPage(totalPence, pinned, rows) {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>didntship.lol</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%23c93622'/><path d='M24 22h26c19 0 30 10 30 28S69 78 50 78H24zm25 42c9 0 14-5 14-14s-5-14-14-14h-8v28z' fill='%23fff'/></svg>">
   <meta name="description" content="People pay to admit they didn’t ship.">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-  <main>
-    <p class="brand">didntship.lol</p>
-    <h1>${pounds(totalPence)} <span>spent on not shipping</span></h1>
-    <p class="lede">People pay to admit they didn’t ship. One line. No edits. No refunds.</p>
-    ${pinnedBlock}
-    <form method="post" action="/checkout">
-      <label>The reason it didn’t ship
-        <textarea name="body" maxlength="140" required placeholder="Waiting on the perfect domain."></textarea>
-      </label>
-      <div class="row">
-        <label>X handle (optional)
-          <input name="handle" maxlength="32" placeholder="yourname">
-        </label>
-        <label>Link (optional)
-          <input name="link" maxlength="200" placeholder="https://">
-        </label>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="didntship.lol home">didntship<span>.lol</span></a>
+    <p class="site-note">The public ledger of almost</p>
+  </header>
+  <main id="main-content">
+    <section class="hero" aria-labelledby="page-title">
+      <p class="eyebrow hero-eyebrow">Collectively wasted so far</p>
+      <h1 id="page-title"><span class="total">${pounds(totalPence)}</span> <span class="hero-line">spent on not shipping</span></h1>
+      <div class="hero-copy">
+        <p class="lede">People pay to admit they didn’t ship. One line. No edits. No refunds.</p>
+        <p class="hero-aside">Because your abandoned side project deserves at least one paying customer.</p>
       </div>
-      <label class="check">
-        <input type="checkbox" name="pin" value="1">
-        Pin this to the top for 1 hour (£25)
-      </label>
-      <button type="submit">Admit it — £3</button>
-    </form>
-    <ol class="feed">${items || "<li class='empty'>Nobody has admitted it yet.</li>"}</ol>
-    <footer>No accounts. No deletes. This is the receipt.</footer>
+    </section>
+    ${pinnedBlock}
+    <section class="submit-section" aria-labelledby="submit-title">
+      <div class="section-intro">
+        <p class="eyebrow">Your turn</p>
+        <h2 id="submit-title">Put it in writing.</h2>
+        <p>£3 buys permanence. Honesty is included.</p>
+      </div>
+      <form method="post" action="/checkout">
+        <label class="field field-body">
+          <span class="label-text">The reason it didn’t ship</span>
+          <span class="label-hint">140 characters, maximum damage</span>
+          <textarea name="body" maxlength="140" required placeholder="Waiting on the perfect domain."></textarea>
+        </label>
+        <div class="row">
+          <label class="field">
+            <span class="label-text">X handle <span class="optional">optional</span></span>
+            <input name="handle" maxlength="32" placeholder="yourname">
+          </label>
+          <label class="field">
+            <span class="label-text">Link <span class="optional">optional</span></span>
+            <input name="link" maxlength="200" placeholder="https://">
+          </label>
+        </div>
+        <div class="form-action">
+          <label class="check">
+            <input type="checkbox" name="pin" value="1">
+            <span><strong>Buy the spotlight</strong>Pin this to the top for 1 hour (£25)</span>
+          </label>
+          <button type="submit"><span>Admit it</span><span>£3</span></button>
+        </div>
+      </form>
+    </section>
+    <section class="wall" aria-labelledby="wall-title">
+      <header class="wall-header">
+        <div>
+          <p class="eyebrow">Freshly unshipped</p>
+          <h2 id="wall-title">The wall</h2>
+        </div>
+        <p>Most recent first. Regret lasts forever.</p>
+      </header>
+      <ol class="feed">${items || "<li class='empty'>Nobody has admitted it yet.</li>"}</ol>
+    </section>
+    <footer><span>No accounts. No deletes.</span> <strong>This is the receipt.</strong></footer>
   </main>
 </body>
 </html>`;
