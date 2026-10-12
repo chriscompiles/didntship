@@ -10,8 +10,15 @@ const demos = [
   { id: 4, body: "Too many Linux distros", handle: "coderama", amount_pence: 300, stripe_session: "cs_demo_two" },
 ];
 
-async function harness(initialRows = [], failMigration = false) {
+async function harness(initialRows = [], failMigration = false, failPinnedInsert = false) {
   const rows = structuredClone(initialRows);
+  let clock = Date.parse("2026-10-12T12:00:00Z");
+  let lockTail = Promise.resolve();
+  let failNextPin = failPinnedInsert;
+  class ReviewDate extends Date {
+    constructor(...args) { super(...(args.length ? args : [clock])); }
+    static now() { return clock; }
+  }
   const routes = new Map();
   const checkoutCalls = [];
   const migrationCalls = [];
@@ -28,26 +35,55 @@ async function harness(initialRows = [], failMigration = false) {
   for (const name of ["raw", "json", "urlencoded", "static"]) express[name] = () => () => {};
   class Pool {
     async connect() {
+      let unlock;
       return {
         async query(sql, parameters) {
           migrationCalls.push({ sql, parameters });
           if (failMigration && sql.includes("ALTER TABLE")) throw new Error("migration failed");
+          if (sql.includes("pg_advisory_xact_lock")) {
+            const previous = lockTail;
+            lockTail = new Promise((resolve) => { unlock = resolve; });
+            await previous;
+          }
           if (sql.includes("ADD COLUMN IF NOT EXISTS currency")) {
             for (const row of rows) {
               row.currency ??= "gbp";
               row.is_demo ??= false;
+              row.pinned_from ??= null;
+              row.is_hidden ??= false;
             }
           }
-          if (sql.startsWith("UPDATE copes")) {
+          if (sql.includes("SET pinned_from = pinned_until")) {
+            for (const row of rows) {
+              if (row.pinned_until && !row.pinned_from) row.pinned_from = new Date(Date.parse(row.pinned_until) - 3600000).toISOString();
+            }
+          }
+          if (sql.startsWith("UPDATE copes SET is_demo")) {
             for (const row of rows) {
               for (const offset of [0, 3]) {
                 if (row.id === parameters[offset] && row.body === parameters[offset + 1] && row.handle === parameters[offset + 2]) row.is_demo = true;
               }
             }
           }
+          if (sql.startsWith("UPDATE copes SET is_hidden")) {
+            for (const row of rows) {
+              if (row.id === parameters[0] && row.body === parameters[1] && row.handle === parameters[2]) row.is_hidden = true;
+            }
+          }
+          if (sql.includes("WITH slot AS")) {
+            assert(unlock, "Pinned writes must hold the allocation lock");
+            assert.match(sql, /starts_at \+ INTERVAL '1 hour'/);
+            if (failNextPin) { failNextPin = false; throw new Error("pinned insert failed"); }
+            if (!rows.some((row) => row.stripe_session === parameters[4])) {
+              const startsAt = Math.max(clock, ...rows.filter((row) => row.pinned_until && Date.parse(row.pinned_until) > clock).map((row) => Date.parse(row.pinned_until)));
+              await new Promise(setImmediate);
+              rows.push({ id: Math.max(0, ...rows.map((row) => row.id || 0)) + 1, body: parameters[0], handle: parameters[1], link: parameters[2], amount_pence: parameters[3], stripe_session: parameters[4], currency: parameters[5], pinned_from: new Date(startsAt).toISOString(), pinned_until: new Date(startsAt + 3600000).toISOString(), is_demo: false });
+            }
+          }
+          if ((sql === "COMMIT" || sql === "ROLLBACK") && unlock) { unlock(); unlock = null; }
           return { rows: [] };
         },
-        release() { released = true; },
+        release() { if (unlock) unlock(); released = true; },
       };
     }
     async query(sql, parameters) {
@@ -64,8 +100,18 @@ async function harness(initialRows = [], failMigration = false) {
         for (const row of rows.filter((row) => !row.is_demo)) totals.set(row.currency, (totals.get(row.currency) || 0) + row.amount_pence);
         return { rows: [...totals].map(([currency, total]) => ({ currency, total: String(total) })) };
       }
-      if (sql.includes("pinned_until > NOW()")) return { rows: [] };
-      if (sql.includes("ORDER BY created_at DESC")) return { rows: [...rows].reverse() };
+      if (sql.includes("MAX(pinned_until)")) {
+        const ends = rows.filter((row) => row.pinned_until && Date.parse(row.pinned_until) > clock).map((row) => Date.parse(row.pinned_until));
+        return { rows: [{ next_pin_at: ends.length ? new Date(Math.max(...ends)).toISOString() : null }] };
+      }
+      if (sql.includes("pinned_from <= NOW()")) {
+        assert.match(sql, /ORDER BY pinned_from ASC, id ASC/);
+        return { rows: rows.filter((row) => !row.is_hidden && row.pinned_from && Date.parse(row.pinned_from) <= clock && Date.parse(row.pinned_until) > clock).sort((a, b) => Date.parse(a.pinned_from) - Date.parse(b.pinned_from) || a.id - b.id).slice(0, 1) };
+      }
+      if (sql.includes("ORDER BY created_at DESC")) {
+        assert.match(sql, /WHERE is_hidden = FALSE/);
+        return { rows: rows.filter((row) => !row.is_hidden).reverse() };
+      }
       throw new Error("Unexpected query: " + sql);
     }
   }
@@ -92,6 +138,7 @@ async function harness(initialRows = [], failMigration = false) {
     process: { env: { PORT: "3000", PUBLIC_URL: "https://example.invalid", STRIPE_SECRET_KEY: "mock", STRIPE_WEBHOOK_SECRET: "mock" }, exit(code) { exitCode = code; } },
     console: { log() {}, error() {} },
     URL,
+    Date: ReviewDate,
     __dirname: path.join(__dirname, ".."),
   };
   vm.runInNewContext(source, context);
@@ -104,6 +151,7 @@ async function harness(initialRows = [], failMigration = false) {
     get released() { return released; },
     get started() { return started; },
     get exitCode() { return exitCode; },
+    advance(milliseconds) { clock += milliseconds; },
     async checkout(pin = "", body = "A new admission") {
       const res = response();
       await routes.get("POST /checkout")({ body: { body, pin } }, res);
@@ -169,14 +217,25 @@ test("migration rolls back and prevents startup on failure", async () => {
   assert.equal(h.exitCode, 1);
 });
 
-test("demos display USD 1 each and the paid headline starts at USD 0", async () => {
+test("the retained demo displays USD 1 and the paid headline starts at USD 0", async () => {
   const h = await harness(demos);
   const html = await h.page();
   assert.match(html, /class="total">\$0<\/span>/);
-  assert.equal((html.match(/class="badge">demo<\/span>/g) || []).length, 2);
-  assert.equal((html.match(/class="amount">\$1<\/span>/g) || []).length, 2);
+  assert.equal((html.match(/class="badge">demo<\/span>/g) || []).length, 1);
+  assert.equal((html.match(/class="amount">\$1<\/span>/g) || []).length, 1);
   assert.match(html, /not included in the paid total/);
   assert(!html.includes("£3"));
+});
+
+test("the Linux demo is removed from the public wall without deleting its payment record", async () => {
+  const h = await harness(demos);
+  const html = await h.page();
+  assert(!html.includes("Too many Linux distros"));
+  assert(html.includes("Spent the morning buying a domain"));
+  assert.equal(h.rows.length, 2);
+  assert.equal(h.rows[1].is_hidden, true);
+  assert.equal(h.rows[1].amount_pence, 300);
+  assert.equal(h.rows[1].stripe_session, "cs_demo_two");
 });
 
 test("the price button responds to selecting and deselecting a pin", async () => {
@@ -225,4 +284,66 @@ test("invalid signatures and missing payment amounts cannot publish posts", asyn
   const malformed = paid("cs_missing"); delete malformed.amount_total;
   assert.equal((await h.webhook("checkout.session.completed", malformed)).code, 400);
   assert.equal(h.rows.length, 0);
+});
+
+function pinned(id) {
+  const session = paid(id, "usd", 2500);
+  session.metadata.body = id;
+  session.metadata.pin = "1";
+  return session;
+}
+
+test("later pin buyers cannot displace an earlier buyer before their hour ends", async () => {
+  const h = await harness();
+  await h.webhook("checkout.session.completed", pinned("Pin A"));
+  h.advance(10 * 60000);
+  await h.webhook("checkout.session.completed", pinned("Pin B"));
+  assert.equal(h.rows[1].pinned_from, h.rows[0].pinned_until);
+  assert.equal(Date.parse(h.rows[1].pinned_until) - Date.parse(h.rows[1].pinned_from), 3600000);
+  let html = await h.page();
+  assert.match(html, /id="pinned-title">Pin A<\/h2>/);
+  assert.match(html, /queued · 12 Oct, 13:00 UTC/);
+  h.advance(50 * 60000);
+  html = await h.page();
+  assert.match(html, /id="pinned-title">Pin B<\/h2>/);
+});
+
+test("simultaneous pin purchases receive separate consecutive hours", async () => {
+  const h = await harness();
+  const results = await Promise.all([
+    h.webhook("checkout.session.completed", pinned("Concurrent A")),
+    h.webhook("checkout.session.completed", pinned("Concurrent B")),
+  ]);
+  assert(results.every((result) => result.code === 200));
+  assert.equal(h.rows.length, 2);
+  assert.equal(h.rows[0].pinned_until, h.rows[1].pinned_from);
+  for (const row of h.rows) assert.equal(Date.parse(row.pinned_until) - Date.parse(row.pinned_from), 3600000);
+});
+
+test("replayed pin payments do not extend the queue", async () => {
+  const h = await harness();
+  await h.webhook("checkout.session.completed", pinned("Replay A"));
+  await h.webhook("checkout.session.completed", pinned("Replay B"));
+  await h.webhook("checkout.session.completed", pinned("Replay A"));
+  await h.webhook("checkout.session.completed", pinned("Replay C"));
+  assert.equal(h.rows.length, 3);
+  assert.equal(h.rows[2].pinned_from, h.rows[1].pinned_until);
+  assert.match(await h.page(), /queue currently ends 12 Oct, 15:00 UTC/);
+});
+
+test("failed pin allocation releases its lock and a retry receives the first slot", async () => {
+  const h = await harness([], false, true);
+  assert.equal((await h.webhook("checkout.session.completed", pinned("Retry pin"))).code, 500);
+  assert.equal(h.rows.length, 0);
+  assert.equal(h.migrationCalls.at(-1).sql, "ROLLBACK");
+  assert.equal((await h.webhook("checkout.session.completed", pinned("Retry pin"))).code, 200);
+  assert.equal(h.rows[0].pinned_from, "2026-10-12T12:00:00.000Z");
+});
+
+test("legacy active pins retain their remaining time and new buyers queue behind them", async () => {
+  const h = await harness([{ id: 5, body: "Legacy pin", amount_pence: 2500, stripe_session: "cs_legacy_pin", pinned_until: "2026-10-12T12:30:00.000Z" }]);
+  assert.equal(h.rows[0].pinned_from, "2026-10-12T11:30:00.000Z");
+  await h.webhook("checkout.session.completed", pinned("New pin"));
+  assert.equal(h.rows[1].pinned_from, "2026-10-12T12:30:00.000Z");
+  assert.match(await h.page(), /id="pinned-title">Legacy pin<\/h2>/);
 });

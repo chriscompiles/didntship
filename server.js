@@ -61,6 +61,12 @@ function postAmount(row) {
   return row.is_demo ? money(POST_PRICE) : money(row.amount_pence, row.currency);
 }
 
+function pinTime(timestamp) {
+  return new Date(timestamp).toLocaleString("en-GB", {
+    timeZone: "UTC", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
+  }) + " UTC";
+}
+
 function escapeHtml(str) {
   return String(str || "")
     .replace(/&/g, "&amp;")
@@ -97,15 +103,38 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
       console.error("Paid checkout has invalid amount or currency:", session.id);
       return res.status(400).send("invalid payment details");
     }
-    const pinnedUntil = pin ? new Date(Date.now() + 60 * 60 * 1000).toISOString() : null;
-
     try {
-      await pool.query(
-        `INSERT INTO copes (body, handle, link, amount_pence, pinned_until, stripe_session, currency)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (stripe_session) DO NOTHING`,
-        [body, handle, link, amount, pinnedUntil, session.id, currency]
-      );
+      if (pin) {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          // Serialize slot allocation, including simultaneous webhook deliveries.
+          await client.query("SELECT pg_advisory_xact_lock(100138, 1)");
+          await client.query(
+            `WITH slot AS (
+               SELECT GREATEST(clock_timestamp(), COALESCE(MAX(pinned_until), clock_timestamp())) AS starts_at
+               FROM copes
+             )
+             INSERT INTO copes (body, handle, link, amount_pence, pinned_until, stripe_session, currency, pinned_from)
+             SELECT $1, $2, $3, $4, starts_at + INTERVAL '1 hour', $5, $6, starts_at
+             FROM slot ON CONFLICT (stripe_session) DO NOTHING`,
+            [body, handle, link, amount, session.id, currency]
+          );
+          await client.query("COMMIT");
+        } catch (err) {
+          await client.query("ROLLBACK");
+          throw err;
+        } finally {
+          client.release();
+        }
+      } else {
+        await pool.query(
+          `INSERT INTO copes (body, handle, link, amount_pence, pinned_until, stripe_session, currency)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (stripe_session) DO NOTHING`,
+          [body, handle, link, amount, null, session.id, currency]
+        );
+      }
     } catch (err) {
       console.error("Insert failed:", err);
       return res.status(500).send("db error");
@@ -127,16 +156,20 @@ app.get("/", async (_req, res) => {
     );
     const pinned = await pool.query(
       `SELECT * FROM copes
-       WHERE pinned_until IS NOT NULL AND pinned_until > NOW()
-       ORDER BY pinned_until DESC
+       WHERE is_hidden = FALSE AND pinned_from <= NOW() AND pinned_until > NOW()
+       ORDER BY pinned_from ASC, id ASC
        LIMIT 1`
+    );
+    const queue = await pool.query(
+      "SELECT MAX(pinned_until) AS next_pin_at FROM copes WHERE pinned_until > NOW()"
     );
     const feed = await pool.query(
       `SELECT * FROM copes
+       WHERE is_hidden = FALSE
        ORDER BY created_at DESC
        LIMIT 100`
     );
-    res.send(renderPage(totals.rows, pinned.rows[0], feed.rows));
+    res.send(renderPage(totals.rows, pinned.rows[0], feed.rows, queue.rows[0].next_pin_at));
   } catch (err) {
     console.error(err);
     res.status(500).send("Database is not ready yet. Check DATABASE_URL.");
@@ -154,7 +187,7 @@ app.post("/checkout", async (req, res) => {
   }
 
   const amount = pin ? PIN_PRICE : POST_PRICE;
-  const label = pin ? "Pinned admission (1 hour)" : "Public admission";
+  const label = pin ? "Pinned admission (1 full hour; queued if busy)" : "Public admission";
 
   try {
     const session = await stripe.checkout.sessions.create({
@@ -190,7 +223,7 @@ app.post("/checkout", async (req, res) => {
   }
 });
 
-function renderPage(totals, pinned, rows) {
+function renderPage(totals, pinned, rows, nextPinAt) {
   const usdTotal = Number(totals.find((total) => total.currency === PAYMENT_CURRENCY)?.total || 0);
   const otherTotals = totals
     .filter((total) => total.currency !== PAYMENT_CURRENCY)
@@ -201,6 +234,9 @@ function renderPage(totals, pinned, rows) {
   const demoNotice = rows.some((row) => row.is_demo)
     ? `<p class="empty">Demo posts are examples and are not included in the paid total.</p>`
     : "";
+  const pinQueueNote = nextPinAt && new Date(nextPinAt) > new Date()
+    ? `The queue currently ends ${pinTime(nextPinAt)}. Your full hour follows earlier pins.`
+    : "Your full hour starts after successful payment. Pins queue when the spotlight is busy.";
   const items = rows
     .map((row) => {
       const handle = row.handle
@@ -211,7 +247,7 @@ function renderPage(totals, pinned, rows) {
         : "";
       const livePin =
         row.pinned_until && new Date(row.pinned_until) > new Date()
-          ? `<span class="badge">pinned</span>`
+          ? `<span class="badge">${row.pinned_from && new Date(row.pinned_from) > new Date() ? "queued · " + pinTime(row.pinned_from) : "pinned"}</span>`
           : "";
       return `<li class="feed-item">
         <article class="admission">
@@ -238,6 +274,7 @@ function renderPage(totals, pinned, rows) {
             ${pinned.link ? `<a class="link" href="${escapeHtml(pinned.link)}" rel="nofollow noopener" target="_blank">link <span aria-hidden="true">↗</span></a>` : ""}
           </div>
           <span class="amount">${postAmount(pinned)}</span>
+          <span>Until ${pinTime(pinned.pinned_until)}</span>
         </div>
       </section>`
     : "";
@@ -295,7 +332,7 @@ function renderPage(totals, pinned, rows) {
         <div class="form-action">
           <label class="check">
             <input type="checkbox" name="pin" value="1">
-            <span><strong>Buy the spotlight</strong>Pin this to the top for 1 hour (${money(PIN_PRICE)} total)</span>
+            <span><strong>Buy the spotlight</strong>Pin this to the top for 1 full hour (${money(PIN_PRICE)} total)<br><small>${pinQueueNote}</small></span>
           </label>
           <button type="submit"><span>Admit it</span><span id="checkout-price">${money(POST_PRICE)}</span></button>
         </div>
@@ -346,6 +383,12 @@ async function ensureSchema() {
     await client.query(`
       ALTER TABLE copes ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'gbp';
       ALTER TABLE copes ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE copes ADD COLUMN IF NOT EXISTS pinned_from TIMESTAMPTZ;
+      ALTER TABLE copes ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN NOT NULL DEFAULT FALSE;
+    `);
+    await client.query(`
+      UPDATE copes SET pinned_from = pinned_until - INTERVAL '1 hour'
+      WHERE pinned_until IS NOT NULL AND pinned_from IS NULL;
     `);
     await client.query(
       `UPDATE copes SET is_demo = TRUE
@@ -353,6 +396,10 @@ async function ensureSchema() {
           OR (id = $4 AND body = $5 AND handle = $6)`,
       [3, "Spent the morning buying a domain instead of shipping the actual product", "chriscompiles",
        4, "Too many Linux distros", "coderama"]
+    );
+    await client.query(
+      "UPDATE copes SET is_hidden = TRUE WHERE id = $1 AND body = $2 AND handle = $3",
+      [4, "Too many Linux distros", "coderama"]
     );
     await client.query("COMMIT");
   } catch (err) {
