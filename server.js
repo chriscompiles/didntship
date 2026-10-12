@@ -14,8 +14,9 @@ const pool = new Pool({
     : false,
 });
 
-const POST_PRICE = 300;
+const POST_PRICE = 100;
 const PIN_PRICE = 2500;
+const PAYMENT_CURRENCY = "usd";
 const MAX_BODY = 140;
 
 const app = express();
@@ -47,11 +48,17 @@ function cleanLink(value) {
   }
 }
 
-function pounds(pence) {
-  return (pence / 100).toLocaleString("en-GB", {
+function money(amountMinor, currency = PAYMENT_CURRENCY) {
+  return (amountMinor / 100).toLocaleString("en-US", {
     style: "currency",
-    currency: "GBP",
+    currency: currency.toUpperCase(),
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
   });
+}
+
+function postAmount(row) {
+  return row.is_demo ? money(POST_PRICE) : money(row.amount_pence, row.currency);
 }
 
 function escapeHtml(str) {
@@ -72,7 +79,7 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  if (event.type === "checkout.session.completed") {
+  if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded") {
     const session = event.data.object;
     if (session.payment_status !== "paid") {
       return res.json({ received: true });
@@ -84,15 +91,20 @@ app.post("/webhook", express.raw({ type: "application/json" }), async (req, res)
     const handle = cleanHandle(session.metadata && session.metadata.handle);
     const link = cleanLink(session.metadata && session.metadata.link);
     const pin = (session.metadata && session.metadata.pin) === "1";
-    const amount = session.amount_total || (pin ? PIN_PRICE : POST_PRICE);
+    const amount = session.amount_total;
+    const currency = session.currency;
+    if (!Number.isInteger(amount) || amount <= 0 || !/^[a-z]{3}$/.test(currency || "")) {
+      console.error("Paid checkout has invalid amount or currency:", session.id);
+      return res.status(400).send("invalid payment details");
+    }
     const pinnedUntil = pin ? new Date(Date.now() + 60 * 60 * 1000).toISOString() : null;
 
     try {
       await pool.query(
-        `INSERT INTO copes (body, handle, link, amount_pence, pinned_until, stripe_session)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO copes (body, handle, link, amount_pence, pinned_until, stripe_session, currency)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (stripe_session) DO NOTHING`,
-        [body, handle, link, amount, pinnedUntil, session.id]
+        [body, handle, link, amount, pinnedUntil, session.id, currency]
       );
     } catch (err) {
       console.error("Insert failed:", err);
@@ -109,7 +121,10 @@ app.use(express.static(path.join(__dirname, "public")));
 
 app.get("/", async (_req, res) => {
   try {
-    const total = await pool.query("SELECT COALESCE(SUM(amount_pence), 0)::int AS total FROM copes");
+    const totals = await pool.query(
+      `SELECT currency, SUM(amount_pence)::bigint AS total FROM copes
+       WHERE is_demo = FALSE GROUP BY currency ORDER BY currency`
+    );
     const pinned = await pool.query(
       `SELECT * FROM copes
        WHERE pinned_until IS NOT NULL AND pinned_until > NOW()
@@ -121,7 +136,7 @@ app.get("/", async (_req, res) => {
        ORDER BY created_at DESC
        LIMIT 100`
     );
-    res.send(renderPage(total.rows[0].total, pinned.rows[0], feed.rows));
+    res.send(renderPage(totals.rows, pinned.rows[0], feed.rows));
   } catch (err) {
     console.error(err);
     res.status(500).send("Database is not ready yet. Check DATABASE_URL.");
@@ -152,12 +167,13 @@ app.post("/checkout", async (req, res) => {
         handle: handle || "",
         link: link || "",
         pin: pin ? "1" : "0",
+        currency: PAYMENT_CURRENCY,
       },
       line_items: [
         {
           quantity: 1,
           price_data: {
-            currency: "gbp",
+            currency: PAYMENT_CURRENCY,
             unit_amount: amount,
             product_data: {
               name: label,
@@ -174,7 +190,17 @@ app.post("/checkout", async (req, res) => {
   }
 });
 
-function renderPage(totalPence, pinned, rows) {
+function renderPage(totals, pinned, rows) {
+  const usdTotal = Number(totals.find((total) => total.currency === PAYMENT_CURRENCY)?.total || 0);
+  const otherTotals = totals
+    .filter((total) => total.currency !== PAYMENT_CURRENCY)
+    .map((total) => money(Number(total.total), total.currency));
+  const earlierPayments = otherTotals.length
+    ? `<p class="site-note">Earlier purchases in other currencies: ${otherTotals.join(" · ")}. Counted separately.</p>`
+    : "";
+  const demoNotice = rows.some((row) => row.is_demo)
+    ? `<p class="empty">Demo posts are examples and are not included in the paid total.</p>`
+    : "";
   const items = rows
     .map((row) => {
       const handle = row.handle
@@ -192,7 +218,7 @@ function renderPage(totalPence, pinned, rows) {
           <p class="admission-body">${escapeHtml(row.body)}</p>
           <div class="meta">
             <div class="meta-person">${handle} ${link}</div>
-            <div class="meta-receipt">${livePin} <span class="amount">${pounds(row.amount_pence)}</span></div>
+            <div class="meta-receipt">${row.is_demo ? '<span class="badge">demo</span>' : ""} ${livePin} <span class="amount">${postAmount(row)}</span></div>
           </div>
         </article>
       </li>`;
@@ -211,7 +237,7 @@ function renderPage(totalPence, pinned, rows) {
             ${pinned.handle ? `<span class="handle">@${escapeHtml(pinned.handle)}</span>` : ""}
             ${pinned.link ? `<a class="link" href="${escapeHtml(pinned.link)}" rel="nofollow noopener" target="_blank">link <span aria-hidden="true">↗</span></a>` : ""}
           </div>
-          <span class="amount">${pounds(pinned.amount_pence)}</span>
+          <span class="amount">${postAmount(pinned)}</span>
         </div>
       </section>`
     : "";
@@ -235,18 +261,20 @@ function renderPage(totalPence, pinned, rows) {
   <main id="main-content">
     <section class="hero" aria-labelledby="page-title">
       <p class="eyebrow hero-eyebrow">Collectively wasted so far</p>
-      <h1 id="page-title"><span class="total">${pounds(totalPence)}</span> <span class="hero-line">spent on not shipping</span></h1>
+      <h1 id="page-title"><span class="total">${money(usdTotal)}</span> <span class="hero-line">spent on not shipping</span></h1>
       <div class="hero-copy">
         <p class="lede">People pay to admit they didn’t ship. One line. No edits. No refunds.</p>
         <p class="hero-aside">Because your abandoned side project deserves at least one paying customer.</p>
       </div>
+      ${earlierPayments}
     </section>
     ${pinnedBlock}
     <section class="submit-section" aria-labelledby="submit-title">
       <div class="section-intro">
         <p class="eyebrow">Your turn</p>
         <h2 id="submit-title">Put it in writing.</h2>
-        <p>£3 buys permanence. Honesty is included.</p>
+        <p>${money(POST_PRICE)} buys permanence. Honesty is included.</p>
+        <p>Prices in US dollars.</p>
       </div>
       <form method="post" action="/checkout">
         <label class="field field-body">
@@ -267,9 +295,9 @@ function renderPage(totalPence, pinned, rows) {
         <div class="form-action">
           <label class="check">
             <input type="checkbox" name="pin" value="1">
-            <span><strong>Buy the spotlight</strong>Pin this to the top for 1 hour (£25)</span>
+            <span><strong>Buy the spotlight</strong>Pin this to the top for 1 hour (${money(PIN_PRICE)} total)</span>
           </label>
-          <button type="submit"><span>Admit it</span><span>£3</span></button>
+          <button type="submit"><span>Admit it</span><span id="checkout-price">${money(POST_PRICE)}</span></button>
         </div>
       </form>
     </section>
@@ -282,15 +310,28 @@ function renderPage(totalPence, pinned, rows) {
         <p>Most recent first. Regret lasts forever.</p>
       </header>
       <ol class="feed">${items || "<li class='empty'>Nobody has admitted it yet.</li>"}</ol>
+      ${demoNotice}
     </section>
     <footer><span>No accounts. No deletes.</span> <strong>This is the receipt.</strong></footer>
   </main>
+  <script>
+    const pinOption = document.querySelector('input[name="pin"]');
+    const checkoutPrice = document.getElementById('checkout-price');
+    function updateCheckoutPrice() {
+      checkoutPrice.textContent = pinOption.checked ? ${JSON.stringify(money(PIN_PRICE))} : ${JSON.stringify(money(POST_PRICE))};
+    }
+    pinOption.addEventListener('change', updateCheckoutPrice);
+    updateCheckoutPrice();
+  </script>
 </body>
 </html>`;
 }
 
 async function ensureSchema() {
-  await pool.query(`
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`
     CREATE TABLE IF NOT EXISTS copes (
       id SERIAL PRIMARY KEY,
       body TEXT NOT NULL,
@@ -301,7 +342,25 @@ async function ensureSchema() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       stripe_session TEXT UNIQUE
     );
-  `);
+    `);
+    await client.query(`
+      ALTER TABLE copes ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'gbp';
+      ALTER TABLE copes ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT FALSE;
+    `);
+    await client.query(
+      `UPDATE copes SET is_demo = TRUE
+       WHERE (id = $1 AND body = $2 AND handle = $3)
+          OR (id = $4 AND body = $5 AND handle = $6)`,
+      [3, "Spent the morning buying a domain instead of shipping the actual product", "chriscompiles",
+       4, "Too many Linux distros", "coderama"]
+    );
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 ensureSchema()
@@ -314,3 +373,4 @@ ensureSchema()
     console.error("Could not start database:", err);
     process.exit(1);
   });
+
