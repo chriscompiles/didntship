@@ -7,8 +7,10 @@
     "test": "node --test"
   },
   "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "dotenv": "^16.4.5",
     "express": "^4.21.2",
+    "opentype.js": "^2.0.0",
     "pg": "^8.13.1",
     "stripe": "^17.4.0"
   }

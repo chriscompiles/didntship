@@ -3,6 +3,8 @@ const path = require("path");
 const express = require("express");
 const { Pool } = require("pg");
 const Stripe = require("stripe");
+const { cardPng } = require("./lib/cards");
+const { socialMeta, renderConfession, renderConfirmation } = require("./lib/sharing");
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
@@ -148,6 +150,94 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
+const PUBLIC_CONFESSION = "SELECT id, body, handle, link, amount_pence, currency, is_demo FROM copes WHERE id = $1 AND is_hidden = FALSE";
+const CONFIRMED_CONFESSION = "SELECT id FROM copes WHERE stripe_session = $1 AND is_hidden = FALSE";
+
+function confessionId(value) {
+  if (!/^[1-9][0-9]{0,9}$/.test(value || "")) return null;
+  const id = Number(value);
+  return id <= 2147483647 ? id : null;
+}
+
+function checkoutSession(value) {
+  return typeof value === "string" && /^cs_[A-Za-z0-9_]{8,200}$/.test(value) ? value : null;
+}
+
+function privateConfirmation(res) {
+  res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex, nofollow" });
+}
+
+app.get("/checkout/success", async (req, res) => {
+  privateConfirmation(res);
+  const session = checkoutSession(req.query.session_id);
+  if (!session) return res.status(400).send(renderConfirmation(false));
+  try {
+    // Only the signed payment webhook publishes confessions; a return URL is not proof of payment.
+    const result = await pool.query(CONFIRMED_CONFESSION, [session]);
+    if (result.rows[0]) return res.redirect(303, `/confessions/${result.rows[0].id}`);
+    return res.status(202).send(renderConfirmation(true));
+  } catch (error) {
+    console.error("Could not confirm confession:", error.message);
+    return res.status(503).send(renderConfirmation(true));
+  }
+});
+
+app.get("/checkout/status", async (req, res) => {
+  privateConfirmation(res);
+  const session = checkoutSession(req.query.session_id);
+  if (!session) return res.status(400).json({ error: "Invalid confirmation link" });
+  try {
+    const result = await pool.query(CONFIRMED_CONFESSION, [session]);
+    if (result.rows[0]) return res.json({ url: `/confessions/${result.rows[0].id}` });
+    return res.status(202).json({ state: "pending" });
+  } catch (error) {
+    console.error("Could not check confession:", error.message);
+    return res.status(503).json({ state: "retry" });
+  }
+});
+
+app.get("/confessions/:id/card.png", async (req, res) => {
+  const id = confessionId(req.params.id);
+  if (!id) return res.status(404).send("Confession not found.");
+  try {
+    const result = await pool.query(PUBLIC_CONFESSION, [id]);
+    if (!result.rows[0]) return res.status(404).send("Confession not found.");
+    const png = await cardPng(result.rows[0]);
+    res.set({ "Content-Type": "image/png", "Cache-Control": "public, max-age=0, must-revalidate", "X-Content-Type-Options": "nosniff" });
+    if (req.query.download === "1") res.set("Content-Disposition", `attachment; filename="didntship-confession-${id}.png"`);
+    return res.send(png);
+  } catch (error) {
+    console.error("Could not render confession card:", error.message);
+    res.set("Retry-After", "3");
+    return res.status(503).send("Your card is temporarily unavailable. Please try again.");
+  }
+});
+
+app.get("/confessions/:id", async (req, res) => {
+  const id = confessionId(req.params.id);
+  if (!id) return res.status(404).send("Confession not found.");
+  try {
+    const result = await pool.query(PUBLIC_CONFESSION, [id]);
+    if (!result.rows[0]) return res.status(404).send("Confession not found.");
+    res.set("Cache-Control", "public, max-age=0, must-revalidate");
+    return res.send(renderConfession(result.rows[0], PUBLIC_URL));
+  } catch (error) {
+    console.error("Could not load confession:", error.message);
+    return res.status(503).send("This confession is temporarily unavailable. Please try again.");
+  }
+});
+
+app.get("/share-card.png", async (_req, res) => {
+  try {
+    const png = await cardPng(null);
+    res.set({ "Content-Type": "image/png", "Cache-Control": "public, max-age=3600", "X-Content-Type-Options": "nosniff" });
+    return res.send(png);
+  } catch (error) {
+    res.set("Retry-After", "3");
+    return res.status(503).send("Card temporarily unavailable.");
+  }
+});
+
 app.get("/", async (_req, res) => {
   try {
     const totals = await pool.query(
@@ -192,7 +282,7 @@ app.post("/checkout", async (req, res) => {
   try {
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      success_url: `${PUBLIC_URL}/?paid=1`,
+      success_url: `${PUBLIC_URL}/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${PUBLIC_URL}/?cancel=1`,
       managed_payments: { enabled: false },
       metadata: {
@@ -256,6 +346,7 @@ function renderPage(totals, pinned, rows, nextPinAt) {
             <div class="meta-person">${handle} ${link}</div>
             <div class="meta-receipt">${row.is_demo ? '<span class="badge">demo</span>' : ""} ${livePin} <span class="amount">${postAmount(row)}</span></div>
           </div>
+          <a class="confession-share" href="/confessions/${row.id}">Share this confession <span aria-hidden="true">↗</span></a>
         </article>
       </li>`;
     })
@@ -286,23 +377,26 @@ function renderPage(totals, pinned, rows, nextPinAt) {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>didntship.lol</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%23c93622'/><path d='M24 22h26c19 0 30 10 30 28S69 78 50 78H24zm25 42c9 0 14-5 14-14s-5-14-14-14h-8v28z' fill='%23fff'/></svg>">
-  <meta name="description" content="People pay to admit they didn’t ship.">
+  <meta name="description" content="Your side project made $0. At least make it famous. Confess your unfinished project for $1 and get a shareable card.">
+  ${socialMeta({ title: "Your side project made $0. At least make it famous.", description: "One line. Your excuse. A $1 confession and a shareable card for your unfinished side project.", url: PUBLIC_URL + "/", image: PUBLIC_URL + "/share-card.png?v=1", alt: "Your side project made $0. At least make it famous. didntship.lol" })}
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <a class="skip-link" href="#main-content">Skip to content</a>
   <header class="site-header">
     <a class="brand" href="/" aria-label="didntship.lol home">didntship<span>.lol</span></a>
-    <p class="site-note">The public ledger of almost</p>
+    <p class="site-note">At least make it famous.</p>
   </header>
   <main id="main-content">
-    <section class="hero" aria-labelledby="page-title">
-      <p class="eyebrow hero-eyebrow">Collectively wasted so far</p>
-      <h1 id="page-title"><span class="total">${money(usdTotal)}</span> <span class="hero-line">spent on not shipping</span></h1>
+    <section class="hero hero-hook" aria-labelledby="page-title">
+      <p class="eyebrow hero-eyebrow">For the projects that never made it</p>
+      <h1 id="page-title" class="hook-title">Your side project made $0.<span class="hook-payoff">At least make it famous.</span></h1>
       <div class="hero-copy">
-        <p class="lede">People pay to admit they didn’t ship. One line. No edits. No refunds.</p>
-        <p class="hero-aside">Because your abandoned side project deserves at least one paying customer.</p>
+        <p class="lede">One line. Your excuse. $1.<br>A place on the wall and a card worth sharing.</p>
+        <p class="hero-aside">The perfect domain. The fifth rewrite. The idea you’ll definitely get back to. We’ve all got one.</p>
       </div>
+      <a class="action-link action-primary hero-cta" href="#submit-title">Make your confession · $1 <span aria-hidden="true">↗</span></a>
+      <p class="collective-total"><span class="total">${money(usdTotal)}</span> collectively spent on admitting it.</p>
       ${earlierPayments}
     </section>
     ${pinnedBlock}
@@ -310,7 +404,7 @@ function renderPage(totals, pinned, rows, nextPinAt) {
       <div class="section-intro">
         <p class="eyebrow">Your turn</p>
         <h2 id="submit-title">Put it in writing.</h2>
-        <p>${money(POST_PRICE)} buys permanence. Honesty is included.</p>
+        <p>${money(POST_PRICE)} buys a permanent confession and your own shareable card. Honesty is included.</p>
         <p>Prices in US dollars.</p>
       </div>
       <form method="post" action="/checkout">

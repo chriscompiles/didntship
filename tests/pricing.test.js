@@ -22,6 +22,8 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
   const routes = new Map();
   const checkoutCalls = [];
   const migrationCalls = [];
+  const readCalls = [];
+  let failRead = false;
   let released = false;
   let started = false;
   let exitCode = null;
@@ -90,7 +92,7 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
       if (sql.startsWith("INSERT INTO copes")) {
         assert.match(sql, /ON CONFLICT \(stripe_session\) DO NOTHING/);
         if (!rows.some((row) => row.stripe_session === parameters[5])) {
-          rows.push({ body: parameters[0], handle: parameters[1], link: parameters[2], amount_pence: parameters[3], pinned_until: parameters[4], stripe_session: parameters[5], currency: parameters[6], is_demo: false });
+          rows.push({ id: Math.max(0, ...rows.map((row) => row.id || 0)) + 1, body: parameters[0], handle: parameters[1], link: parameters[2], amount_pence: parameters[3], pinned_until: parameters[4], stripe_session: parameters[5], currency: parameters[6], is_demo: false });
         }
         return { rows: [] };
       }
@@ -111,6 +113,19 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
       if (sql.includes("ORDER BY created_at DESC")) {
         assert.match(sql, /WHERE is_hidden = FALSE/);
         return { rows: rows.filter((row) => !row.is_hidden).reverse() };
+      }
+      if (sql.includes("WHERE id = $1 AND is_hidden = FALSE")) {
+        readCalls.push({ sql, parameters });
+        if (failRead) throw new Error("database unavailable");
+        assert(!sql.includes("stripe_session"));
+        const row = rows.find((row) => row.id === parameters[0] && !row.is_hidden);
+        return { rows: row ? [Object.fromEntries(["id", "body", "handle", "link", "amount_pence", "currency", "is_demo"].map((key) => [key, row[key]]))] : [] };
+      }
+      if (sql.includes("WHERE stripe_session = $1 AND is_hidden = FALSE")) {
+        readCalls.push({ sql, parameters });
+        if (failRead) throw new Error("database unavailable");
+        const row = rows.find((row) => row.stripe_session === parameters[0] && !row.is_hidden);
+        return { rows: row ? [{ id: row.id }] : [] };
       }
       throw new Error("Unexpected query: " + sql);
     }
@@ -133,6 +148,8 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
       if (name === "pg") return { Pool };
       if (name === "stripe") return Stripe;
       if (name === "path") return path;
+      if (name === "./lib/cards") return require("../lib/cards");
+      if (name === "./lib/sharing") return require("../lib/sharing");
       throw new Error("Unexpected dependency: " + name);
     },
     process: { env: { PORT: "3000", PUBLIC_URL: "https://example.invalid", STRIPE_SECRET_KEY: "mock", STRIPE_WEBHOOK_SECRET: "mock" }, exit(code) { exitCode = code; } },
@@ -144,10 +161,16 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
   vm.runInNewContext(source, context);
   await new Promise(setImmediate);
   function response() {
-    return { code: 200, status(code) { this.code = code; return this; }, send(body) { this.body = body; return this; }, json(body) { this.body = body; return this; }, redirect(code, url) { this.code = code; this.url = url; return this; } };
+    return { code: 200, headers: {}, set(name, value) { if (typeof name === "object") Object.assign(this.headers, name); else this.headers[name] = value; return this; }, status(code) { this.code = code; return this; }, send(body) { this.body = body; return this; }, json(body) { this.body = body; return this; }, redirect(code, url) { this.code = code; this.url = url; return this; } };
   }
   return {
-    rows, checkoutCalls, migrationCalls, context,
+    rows, checkoutCalls, migrationCalls, context, readCalls,
+    failReads() { failRead = true; },
+    async get(route, request = {}) {
+      const res = response();
+      await routes.get("GET " + route)({ params: {}, query: {}, ...request }, res);
+      return res;
+    },
     get released() { return released; },
     get started() { return started; },
     get exitCode() { return exitCode; },
@@ -346,4 +369,138 @@ test("legacy active pins retain their remaining time and new buyers queue behind
   await h.webhook("checkout.session.completed", pinned("New pin"));
   assert.equal(h.rows[1].pinned_from, "2026-10-12T12:30:00.000Z");
   assert.match(await h.page(), /id="pinned-title">Legacy pin<\/h2>/);
+});
+
+test("the hook leads the homepage while the paid total remains accurate supporting detail", async () => {
+  const h = await harness();
+  await h.webhook("checkout.session.completed", paid("cs_hook_test"));
+  const html = await h.page();
+  assert.match(html, /Your side project made \$0\./);
+  assert.match(html, /At least make it famous\./);
+  assert.match(html, /class="collective-total"><span class="total">\$1<\/span>/);
+  assert.match(html, /href="\/confessions\/1"/);
+  assert.match(html, /name="twitter:card" content="summary_large_image"/);
+});
+
+test("checkout returns buyers to a private confirmation URL with Stripe's session placeholder", async () => {
+  const h = await harness();
+  await h.checkout();
+  assert.equal(h.checkoutCalls[0].success_url, "https://example.invalid/checkout/success?session_id={CHECKOUT_SESSION_ID}");
+});
+
+test("a checkout return cannot publish a confession before its signed webhook arrives", async () => {
+  const h = await harness();
+  const session = "cs_test_confirmation_pending";
+  let res = await h.get("/checkout/success", { query: { session_id: session } });
+  assert.equal(res.code, 202);
+  assert.equal(res.headers["Cache-Control"], "no-store");
+  assert.equal(res.headers["Referrer-Policy"], "no-referrer");
+  assert.match(res.headers["X-Robots-Tag"], /noindex/);
+  assert.equal(h.rows.length, 0);
+  assert(!res.body.includes(session));
+  assert.match(res.body, /checkout-status.js/);
+  await h.webhook("checkout.session.completed", paid(session, "usd", 100, "unpaid"));
+  assert.equal((await h.get("/checkout/status", { query: { session_id: session } })).code, 202);
+  await h.webhook("checkout.session.async_payment_succeeded", paid(session));
+  res = await h.get("/checkout/status", { query: { session_id: session } });
+  assert.equal(res.code, 200);
+  assert.equal(JSON.stringify(res.body), '{"url":"/confessions/1"}');
+  res = await h.get("/checkout/success", { query: { session_id: session } });
+  assert.equal(res.code, 303);
+  assert.equal(res.url, "/confessions/1");
+});
+
+test("confirmation rejects malformed session values without querying the database", async () => {
+  const h = await harness();
+  for (const session_id of [undefined, "", "<script>", ["cs_test_one", "cs_test_two"], "cs_" + "x".repeat(201)]) {
+    assert.equal((await h.get("/checkout/success", { query: { session_id } })).code, 400);
+    assert.equal((await h.get("/checkout/status", { query: { session_id } })).code, 400);
+  }
+  assert.equal(h.readCalls.length, 0);
+});
+
+test("confirmation handles database downtime without claiming payment succeeded", async () => {
+  const h = await harness();
+  h.failReads();
+  const request = { query: { session_id: "cs_test_retry_after_outage" } };
+  assert.equal((await h.get("/checkout/success", request)).code, 503);
+  const response = await h.get("/checkout/status", request);
+  assert.equal(response.code, 503);
+  assert.equal(response.body.state, "retry");
+});
+
+test("public confession pages include per-confession metadata and share actions without payment identifiers", async () => {
+  const h = await harness([{ id: 9, body: 'I rewrote "everything" & shipped nothing.', handle: "builder", amount_pence: 100, stripe_session: "cs_test_private_identifier", currency: "usd" }]);
+  const res = await h.get("/confessions/:id", { params: { id: "9" } });
+  assert.equal(res.code, 200);
+  assert.match(res.body, /content="https:\/\/example.invalid\/confessions\/9\/card.png\?v=1"/);
+  assert.match(res.body, /rel="canonical" href="https:\/\/example.invalid\/confessions\/9"/);
+  assert.match(res.body, /Download card/);
+  assert.match(res.body, /Copy link/);
+  assert.match(res.body, /twitter.com\/intent\/tweet\?/);
+  assert(!res.body.includes("cs_test_private_identifier"));
+  assert(!res.body.includes("stripe_session"));
+});
+
+test("missing, hidden and malformed confession IDs never expose pages or images", async () => {
+  const h = await harness([{ id: 9, body: "Hidden confession", is_hidden: true }]);
+  for (const id of ["9", "999", "0", "-1", "1.5", "1 OR 1=1", "2147483648", "9999999999999999"]) {
+    for (const route of ["/confessions/:id", "/confessions/:id/card.png"]) {
+      const response = await h.get(route, { params: { id } });
+      assert.equal(response.code, 404);
+      assert(!response.body.includes("Hidden confession"));
+    }
+  }
+});
+
+test("confession PNGs download with the correct filename and hiding a post overrides the render cache", async () => {
+  const h = await harness([{ id: 9, body: "A very public confession.", currency: "usd", amount_pence: 100 }]);
+  const request = { params: { id: "9" }, query: { download: "1" } };
+  const response = await h.get("/confessions/:id/card.png", request);
+  assert.equal(response.code, 200);
+  assert.equal(response.headers["Content-Type"], "image/png");
+  assert.equal(response.headers["Content-Disposition"], 'attachment; filename="didntship-confession-9.png"');
+  assert.equal(response.body.subarray(1, 4).toString(), "PNG");
+  assert.equal(response.body.readUInt32BE(16), 1200);
+  assert.equal(response.body.readUInt32BE(20), 630);
+  assert(response.body.byteLength < 5 * 1024 * 1024);
+  h.rows[0].is_hidden = true;
+  assert.equal((await h.get("/confessions/:id/card.png", request)).code, 404);
+});
+
+test("legacy public confessions get cards and the homepage gets a generic share image", async () => {
+  const h = await harness(demos);
+  assert.equal((await h.get("/confessions/:id/card.png", { params: { id: "3" } })).code, 200);
+  assert.equal((await h.get("/share-card.png")).body.readUInt32BE(16), 1200);
+});
+
+test("untrusted confession text stays escaped in HTML and image markup", async () => {
+  const { cardSvg } = require("../lib/cards");
+  const row = { id: 9, body: '<script>alert("x")</script> & <image href="https://attacker.invalid/x"/>', handle: 'a" onload="x' };
+  const { renderConfession } = require("../lib/sharing");
+  const html = renderConfession(row, "https://example.invalid");
+  assert(!html.includes('<script>alert("x")</script>'));
+  assert(!html.includes('<image href='));
+  const svg = cardSvg(row);
+  assert(!svg.includes('<script>'));
+  assert(!svg.includes('<image href='));
+  assert.match(svg, /&lt;/);
+});
+
+test("long words, wide characters and ordinary sentences fit inside the share card", () => {
+  const { layoutText, textWidth } = require("../lib/cards");
+  for (const body of ["W".repeat(140), "no_spaces_".repeat(14), "word ".repeat(28).trim(), "🚀☕😂 ".repeat(25), "I spent six months buying domains instead of shipping anything."]) {
+    const { size, lines } = layoutText(body);
+    assert(lines.every((line) => textWidth(line, size) <= 1000));
+    assert(lines.length * size * 1.24 <= 290);
+    assert.equal(lines.join("").replace(/\s/g, ""), body.replace(/\s/g, ""));
+  }
+});
+
+test("emoji use the bundled emoji font and a truncated surrogate cannot break PNG rendering", async () => {
+  const { cardPng, cardSvg } = require("../lib/cards");
+  const row = { id: 10, body: "Coffee ☕, rocket 🚀, developer 🧑‍💻 and a flag 🇬🇧. " + "\ud83d" };
+  assert.match(cardSvg(row), /font-family="Noto Emoji"/);
+  const png = await cardPng(row);
+  assert.equal(png.subarray(1, 4).toString(), "PNG");
 });
