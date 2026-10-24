@@ -13,5 +13,8 @@
     "opentype.js": "^2.0.0",
     "pg": "^8.13.1",
     "stripe": "^17.4.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.11"
   }
 }

@@ -28,6 +28,7 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
   let started = false;
   let exitCode = null;
   const app = {
+    set() {},
     post(route, ...handlers) { routes.set("POST " + route, handlers.at(-1)); },
     get(route, ...handlers) { routes.set("GET " + route, handlers.at(-1)); },
     use() {},
@@ -150,6 +151,10 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
       if (name === "path") return path;
       if (name === "./lib/cards") return require("../lib/cards");
       if (name === "./lib/sharing") return require("../lib/sharing");
+      if (name === "./lib/community-views") return require("../lib/community-views");
+      if (name === "./lib/community") return { SCHEMA: require("../lib/community").SCHEMA, createCommunity: () => ({
+        async refreshAwards() {}, async enrich(rows) { return rows; }, async latestAward() { return null; },
+      }) };
       throw new Error("Unexpected dependency: " + name);
     },
     process: { env: { PORT: "3000", PUBLIC_URL: "https://example.invalid", STRIPE_SECRET_KEY: "mock", STRIPE_WEBHOOK_SECRET: "mock" }, exit(code) { exitCode = code; } },

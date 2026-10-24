@@ -5,6 +5,8 @@ const { Pool } = require("pg");
 const Stripe = require("stripe");
 const { cardPng } = require("./lib/cards");
 const { socialMeta, renderConfession, renderConfirmation } = require("./lib/sharing");
+const { createCommunity, SCHEMA: COMMUNITY_SCHEMA } = require("./lib/community");
+const { reactionControl, awardBadge, weeklySection } = require("./lib/community-views");
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
@@ -22,6 +24,13 @@ const PAYMENT_CURRENCY = "usd";
 const MAX_BODY = 140;
 
 const app = express();
+app.set("trust proxy", 1);
+const community = createCommunity(pool, PUBLIC_URL);
+
+async function refreshCommunity() {
+  try { await community.refreshAwards(); }
+  catch (error) { console.error("Weekly award check failed:", error.message); }
+}
 
 function cleanText(value, max) {
   return String(value || "")
@@ -167,6 +176,24 @@ function privateConfirmation(res) {
   res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex, nofollow" });
 }
 
+app.get("/api/reactions", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const raw = req.query.ids;
+  if (typeof raw !== "string" || raw.length > 1100) return res.status(400).json({ error: "Invalid confession IDs." });
+  const ids = [...new Set(raw.split(",").map(confessionId))];
+  if (!ids.length || ids.length > 100 || ids.some((id) => !id)) return res.status(400).json({ error: "Invalid confession IDs." });
+  try { return res.json(await community.reactionStates(ids, req)); }
+  catch (error) { console.error("Could not load reactions:", error.message); return res.status(503).json({ error: "Reactions are temporarily unavailable." }); }
+});
+
+app.post("/api/confessions/:id/reaction", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const id = confessionId(req.params.id);
+  if (!id) return res.status(404).json({ error: "Confession not found." });
+  try { return await community.react(id, req, res); }
+  catch (error) { console.error("Could not save reaction:", error.message); return res.status(503).json({ error: "Couldn’t save your reaction. Please try again." }); }
+});
+
 app.get("/checkout/success", async (req, res) => {
   privateConfirmation(res);
   const session = checkoutSession(req.query.session_id);
@@ -202,7 +229,9 @@ app.get("/confessions/:id/card.png", async (req, res) => {
   try {
     const result = await pool.query(PUBLIC_CONFESSION, [id]);
     if (!result.rows[0]) return res.status(404).send("Confession not found.");
-    const png = await cardPng(result.rows[0]);
+    await refreshCommunity();
+    const [row] = await community.enrich(result.rows);
+    const png = await cardPng(row);
     res.set({ "Content-Type": "image/png", "Cache-Control": "public, max-age=0, must-revalidate", "X-Content-Type-Options": "nosniff" });
     if (req.query.download === "1") res.set("Content-Disposition", `attachment; filename="didntship-confession-${id}.png"`);
     return res.send(png);
@@ -219,8 +248,10 @@ app.get("/confessions/:id", async (req, res) => {
   try {
     const result = await pool.query(PUBLIC_CONFESSION, [id]);
     if (!result.rows[0]) return res.status(404).send("Confession not found.");
+    await refreshCommunity();
+    const [row] = await community.enrich(result.rows);
     res.set("Cache-Control", "public, max-age=0, must-revalidate");
-    return res.send(renderConfession(result.rows[0], PUBLIC_URL));
+    return res.send(renderConfession(row, PUBLIC_URL));
   } catch (error) {
     console.error("Could not load confession:", error.message);
     return res.status(503).send("This confession is temporarily unavailable. Please try again.");
@@ -259,7 +290,11 @@ app.get("/", async (_req, res) => {
        ORDER BY created_at DESC
        LIMIT 100`
     );
-    res.send(renderPage(totals.rows, pinned.rows[0], feed.rows, queue.rows[0].next_pin_at));
+    await refreshCommunity();
+    const rows = await community.enrich(feed.rows);
+    const winner = await community.latestAward();
+    res.set("Cache-Control", "public, max-age=0, must-revalidate");
+    res.send(renderPage(totals.rows, pinned.rows[0], rows, queue.rows[0].next_pin_at, winner));
   } catch (err) {
     console.error(err);
     res.status(500).send("Database is not ready yet. Check DATABASE_URL.");
@@ -313,7 +348,7 @@ app.post("/checkout", async (req, res) => {
   }
 });
 
-function renderPage(totals, pinned, rows, nextPinAt) {
+function renderPage(totals, pinned, rows, nextPinAt, winner) {
   const usdTotal = Number(totals.find((total) => total.currency === PAYMENT_CURRENCY)?.total || 0);
   const otherTotals = totals
     .filter((total) => total.currency !== PAYMENT_CURRENCY)
@@ -341,11 +376,13 @@ function renderPage(totals, pinned, rows, nextPinAt) {
           : "";
       return `<li class="feed-item">
         <article class="admission">
+          ${awardBadge(row)}
           <p class="admission-body">${escapeHtml(row.body)}</p>
           <div class="meta">
             <div class="meta-person">${handle} ${link}</div>
             <div class="meta-receipt">${row.is_demo ? '<span class="badge">demo</span>' : ""} ${livePin} <span class="amount">${postAmount(row)}</span></div>
           </div>
+          ${reactionControl(row)}
           <a class="confession-share" href="/confessions/${row.id}">Share this confession <span aria-hidden="true">↗</span></a>
         </article>
       </li>`;
@@ -400,6 +437,7 @@ function renderPage(totals, pinned, rows, nextPinAt) {
       ${earlierPayments}
     </section>
     ${pinnedBlock}
+    ${weeklySection(winner)}
     <section class="submit-section" aria-labelledby="submit-title">
       <div class="section-intro">
         <p class="eyebrow">Your turn</p>
@@ -442,6 +480,7 @@ function renderPage(totals, pinned, rows, nextPinAt) {
       </header>
       <ol class="feed">${items || "<li class='empty'>Nobody has admitted it yet.</li>"}</ol>
       ${demoNotice}
+      <noscript><p class="reaction-note">Enable JavaScript to react to confessions. Reading and sharing still work without it.</p></noscript>
     </section>
     <footer><span>No accounts. No deletes.</span> <strong>This is the receipt.</strong></footer>
   </main>
@@ -454,6 +493,7 @@ function renderPage(totals, pinned, rows, nextPinAt) {
     pinOption.addEventListener('change', updateCheckoutPrice);
     updateCheckoutPrice();
   </script>
+  <script src="/reactions.js" defer></script>
 </body>
 </html>`;
 }
@@ -495,6 +535,7 @@ async function ensureSchema() {
       "UPDATE copes SET is_hidden = TRUE WHERE id = $1 AND body = $2 AND handle = $3",
       [4, "Too many Linux distros", "coderama"]
     );
+    await client.query(COMMUNITY_SCHEMA);
     await client.query("COMMIT");
   } catch (err) {
     await client.query("ROLLBACK");
