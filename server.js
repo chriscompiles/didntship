@@ -4,7 +4,7 @@ const express = require("express");
 const { Pool } = require("pg");
 const Stripe = require("stripe");
 const { cardPng } = require("./lib/cards");
-const { socialMeta, renderConfession, renderConfirmation } = require("./lib/sharing");
+const { socialMeta, renderConfession, renderConfirmation, WEB_ANALYTICS } = require("./lib/sharing");
 const { createCommunity, SCHEMA: COMMUNITY_SCHEMA } = require("./lib/community");
 const { reactionControl, awardBadge, weeklySection } = require("./lib/community-views");
 
@@ -494,6 +494,7 @@ function renderPage(totals, pinned, rows, nextPinAt, winner) {
     updateCheckoutPrice();
   </script>
   <script src="/reactions.js" defer></script>
+  ${WEB_ANALYTICS}
 </body>
 </html>`;
 }
