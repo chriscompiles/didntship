@@ -5,6 +5,7 @@ const { createCommunity, SCHEMA, browserToken } = require("../lib/community");
 const { createTestDatabase } = require("./helpers/community-db");
 const { renderConfession } = require("../lib/sharing");
 const { cardSvg, cardPng } = require("../lib/cards");
+const { publishOwnerConfession } = require("../lib/owner-confession");
 
 let fixture, community, clock;
 const token = (number) => number.toString(16).padStart(64, "0");
@@ -68,6 +69,37 @@ test("demos, hidden posts, missing posts and unpaid fixtures cannot receive reac
   await fixture.seed(7, undefined, { amount: 0, session: null });
   for (const id of [3,4,7,999]) assert.equal((await react(id, 1)).statusCode, 404);
   assert.deepEqual(await community.reactionStates([3,4,7], request(1)), []);
+});
+
+test("owner conversion is idempotent, preserves history and only changes the exact approved demo", async () => {
+  const body = "Spent the morning buying a domain instead of shipping the actual product";
+  await fixture.seed(3, "2026-08-31T08:18:42Z", { demo: true, body, handle: "chriscompiles", amount: 300 });
+  await fixture.seed(4, undefined, { demo: true, body, handle: "chriscompiles" });
+  await fixture.seed(5);
+  const before = (await fixture.pool.query("SELECT * FROM copes ORDER BY id")).rows;
+  await publishOwnerConfession(fixture.pool);
+  await publishOwnerConfession(fixture.pool);
+  const after = (await fixture.pool.query("SELECT * FROM copes ORDER BY id")).rows;
+  assert.deepEqual(after, [{ ...before[0], is_demo: false, is_complimentary: true }, ...before.slice(1)]);
+  await fixture.pool.query("UPDATE copes SET is_complimentary=FALSE, is_demo=TRUE, body='A different confession' WHERE id=3");
+  await publishOwnerConfession(fixture.pool);
+  assert.equal((await fixture.pool.query("SELECT is_complimentary FROM copes WHERE id=3")).rows[0].is_complimentary, false);
+  await fixture.pool.query("UPDATE copes SET body=$1, handle='someone_else' WHERE id=3", [body]);
+  await publishOwnerConfession(fixture.pool);
+  assert.equal((await fixture.pool.query("SELECT is_complimentary FROM copes WHERE id=3")).rows[0].is_complimentary, false);
+});
+
+test("complimentary posts accept normal reactions without creating a payment or entering paid awards", async () => {
+  await fixture.seed(3, undefined, { complimentary: true, amount: 0, session: null });
+  await fixture.seed(4, undefined, { complimentary: true, amount: 300 });
+  for (const id of [3,4]) for (const browser of [1,2,3]) assert.equal((await react(id, browser)).statusCode, 200);
+  assert.deepEqual(await community.reactionStates([3], request(1)), [{ id: 3, count: 3, reacted: true }]);
+  clock = "2026-10-26T00:00:00Z";
+  await community.refreshAwards();
+  assert.equal(await community.latestAward(), null);
+  assert.deepEqual((await fixture.pool.query("SELECT amount_pence, stripe_session FROM copes WHERE id=3")).rows[0], { amount_pence: 0, stripe_session: null });
+  await fixture.pool.query("UPDATE copes SET is_hidden=TRUE WHERE id=3");
+  assert.equal((await react(3, 4)).statusCode, 404);
 });
 
 test("cross-site or absent Origin cannot write a reaction", async () => {
@@ -146,10 +178,12 @@ test("ties go to earliest submission, then lowest ID", async () => {
   assert.equal((await community.latestAward()).id, 5);
 });
 
-test("only that week's eligible paid confessions compete; old, demo and hidden posts do not", async () => {
+test("only that week's eligible paid confessions compete; old, demo, complimentary and hidden posts do not", async () => {
   await competingWeek();
   await fixture.seed(7, "2026-10-10T00:00:00Z");
   await fixture.seed(8, undefined, { demo: true }); await fixture.seed(9, undefined, { hidden: true });
+  await fixture.seed(10, undefined, { complimentary: true });
+  for (const browser of [1,2,3,4,5]) await react(10, browser);
   for (const browser of [1,2,3,4]) await react(7, browser);
   clock = "2026-10-26T00:00:00Z"; await community.refreshAwards();
   assert.equal((await community.latestAward()).id, 5);

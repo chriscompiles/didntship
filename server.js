@@ -7,6 +7,7 @@ const { cardPng } = require("./lib/cards");
 const { socialMeta, renderConfession, renderConfirmation, WEB_ANALYTICS } = require("./lib/sharing");
 const { createCommunity, SCHEMA: COMMUNITY_SCHEMA } = require("./lib/community");
 const { reactionControl, awardBadge, weeklySection } = require("./lib/community-views");
+const { publishOwnerConfession } = require("./lib/owner-confession");
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_URL = (process.env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
@@ -69,7 +70,7 @@ function money(amountMinor, currency = PAYMENT_CURRENCY) {
 }
 
 function postAmount(row) {
-  return row.is_demo ? money(POST_PRICE) : money(row.amount_pence, row.currency);
+  return row.is_demo || row.is_complimentary ? money(POST_PRICE) : money(row.amount_pence, row.currency);
 }
 
 function pinTime(timestamp) {
@@ -159,7 +160,7 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-const PUBLIC_CONFESSION = "SELECT id, body, handle, link, amount_pence, currency, is_demo FROM copes WHERE id = $1 AND is_hidden = FALSE";
+const PUBLIC_CONFESSION = "SELECT id, body, handle, link, amount_pence, currency, is_demo, is_complimentary FROM copes WHERE id = $1 AND is_hidden = FALSE";
 const CONFIRMED_CONFESSION = "SELECT id FROM copes WHERE stripe_session = $1 AND is_hidden = FALSE";
 
 function confessionId(value) {
@@ -272,8 +273,11 @@ app.get("/share-card.png", async (_req, res) => {
 app.get("/", async (_req, res) => {
   try {
     const totals = await pool.query(
-      `SELECT currency, SUM(amount_pence)::bigint AS total FROM copes
-       WHERE is_demo = FALSE GROUP BY currency ORDER BY currency`
+      `SELECT CASE WHEN is_complimentary THEN $1 ELSE currency END AS currency,
+         SUM(CASE WHEN is_complimentary THEN 0 ELSE amount_pence END)::bigint AS total,
+         (COUNT(*) FILTER (WHERE is_complimentary) * $2)::bigint AS complimentary_total
+       FROM copes WHERE is_demo = FALSE GROUP BY 1 ORDER BY 1`,
+      [PAYMENT_CURRENCY, POST_PRICE]
     );
     const pinned = await pool.query(
       `SELECT * FROM copes
@@ -349,7 +353,8 @@ app.post("/checkout", async (req, res) => {
 });
 
 function renderPage(totals, pinned, rows, nextPinAt, winner) {
-  const usdTotal = Number(totals.find((total) => total.currency === PAYMENT_CURRENCY)?.total || 0);
+  const usd = totals.find((total) => total.currency === PAYMENT_CURRENCY);
+  const usdTotal = Number(usd?.total || 0) + Number(usd?.complimentary_total || 0);
   const otherTotals = totals
     .filter((total) => total.currency !== PAYMENT_CURRENCY)
     .map((total) => money(Number(total.total), total.currency));
@@ -518,6 +523,7 @@ async function ensureSchema() {
     await client.query(`
       ALTER TABLE copes ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'gbp';
       ALTER TABLE copes ADD COLUMN IF NOT EXISTS is_demo BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE copes ADD COLUMN IF NOT EXISTS is_complimentary BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE copes ADD COLUMN IF NOT EXISTS pinned_from TIMESTAMPTZ;
       ALTER TABLE copes ADD COLUMN IF NOT EXISTS is_hidden BOOLEAN NOT NULL DEFAULT FALSE;
     `);
@@ -527,11 +533,10 @@ async function ensureSchema() {
     `);
     await client.query(
       `UPDATE copes SET is_demo = TRUE
-       WHERE (id = $1 AND body = $2 AND handle = $3)
-          OR (id = $4 AND body = $5 AND handle = $6)`,
-      [3, "Spent the morning buying a domain instead of shipping the actual product", "chriscompiles",
-       4, "Too many Linux distros", "coderama"]
+       WHERE id = $1 AND body = $2 AND handle = $3`,
+      [4, "Too many Linux distros", "coderama"]
     );
+    await publishOwnerConfession(client);
     await client.query(
       "UPDATE copes SET is_hidden = TRUE WHERE id = $1 AND body = $2 AND handle = $3",
       [4, "Too many Linux distros", "coderama"]

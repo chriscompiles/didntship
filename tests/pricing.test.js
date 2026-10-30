@@ -6,8 +6,8 @@ const vm = require("node:vm");
 
 const source = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
 const demos = [
-  { id: 3, body: "Spent the morning buying a domain instead of shipping the actual product", handle: "chriscompiles", amount_pence: 300, stripe_session: "cs_demo_one" },
-  { id: 4, body: "Too many Linux distros", handle: "coderama", amount_pence: 300, stripe_session: "cs_demo_two" },
+  { id: 3, body: "Spent the morning buying a domain instead of shipping the actual product", handle: "chriscompiles", amount_pence: 300, stripe_session: "cs_demo_one", is_demo: true },
+  { id: 4, body: "Too many Linux distros", handle: "coderama", amount_pence: 300, stripe_session: "cs_demo_two", is_demo: true },
 ];
 
 async function harness(initialRows = [], failMigration = false, failPinnedInsert = false) {
@@ -52,6 +52,7 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
             for (const row of rows) {
               row.currency ??= "gbp";
               row.is_demo ??= false;
+              row.is_complimentary ??= false;
               row.pinned_from ??= null;
               row.is_hidden ??= false;
             }
@@ -61,7 +62,14 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
               if (row.pinned_until && !row.pinned_from) row.pinned_from = new Date(Date.parse(row.pinned_until) - 3600000).toISOString();
             }
           }
-          if (sql.startsWith("UPDATE copes SET is_demo")) {
+          if (sql.startsWith("UPDATE copes SET is_demo = FALSE, is_complimentary = TRUE")) {
+            for (const row of rows) {
+              if (row.id === parameters[0] && row.body === parameters[1] && row.handle === parameters[2] && (row.is_demo || row.is_complimentary)) {
+                row.is_demo = false;
+                row.is_complimentary = true;
+              }
+            }
+          } else if (sql.startsWith("UPDATE copes SET is_demo")) {
             for (const row of rows) {
               for (const offset of [0, 3]) {
                 if (row.id === parameters[offset] && row.body === parameters[offset + 1] && row.handle === parameters[offset + 2]) row.is_demo = true;
@@ -97,11 +105,18 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
         }
         return { rows: [] };
       }
-      if (sql.includes("SUM(amount_pence)")) {
-        assert.match(sql, /WHERE is_demo = FALSE GROUP BY currency/);
+      if (sql.includes("AS complimentary_total")) {
+        assert.match(sql, /SUM\(CASE WHEN is_complimentary THEN 0 ELSE amount_pence END\)/);
+        assert.match(sql, /WHERE is_demo = FALSE/);
         const totals = new Map();
-        for (const row of rows.filter((row) => !row.is_demo)) totals.set(row.currency, (totals.get(row.currency) || 0) + row.amount_pence);
-        return { rows: [...totals].map(([currency, total]) => ({ currency, total: String(total) })) };
+        for (const row of rows.filter((row) => !row.is_demo)) {
+          const currency = row.is_complimentary ? parameters[0] : row.currency;
+          const total = totals.get(currency) || { currency, total: 0, complimentary_total: 0 };
+          total.total += row.is_complimentary ? 0 : row.amount_pence;
+          total.complimentary_total += row.is_complimentary ? parameters[1] : 0;
+          totals.set(currency, total);
+        }
+        return { rows: [...totals.values()] };
       }
       if (sql.includes("MAX(pinned_until)")) {
         const ends = rows.filter((row) => row.pinned_until && Date.parse(row.pinned_until) > clock).map((row) => Date.parse(row.pinned_until));
@@ -120,7 +135,7 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
         if (failRead) throw new Error("database unavailable");
         assert(!sql.includes("stripe_session"));
         const row = rows.find((row) => row.id === parameters[0] && !row.is_hidden);
-        return { rows: row ? [Object.fromEntries(["id", "body", "handle", "link", "amount_pence", "currency", "is_demo"].map((key) => [key, row[key]]))] : [] };
+        return { rows: row ? [Object.fromEntries(["id", "body", "handle", "link", "amount_pence", "currency", "is_demo", "is_complimentary"].map((key) => [key, row[key]]))] : [] };
       }
       if (sql.includes("WHERE stripe_session = $1 AND is_hidden = FALSE")) {
         readCalls.push({ sql, parameters });
@@ -152,6 +167,7 @@ async function harness(initialRows = [], failMigration = false, failPinnedInsert
       if (name === "./lib/cards") return require("../lib/cards");
       if (name === "./lib/sharing") return require("../lib/sharing");
       if (name === "./lib/community-views") return require("../lib/community-views");
+      if (name === "./lib/owner-confession") return require("../lib/owner-confession");
       if (name === "./lib/community") return { SCHEMA: require("../lib/community").SCHEMA, createCommunity: () => ({
         async refreshAwards() {}, async enrich(rows) { return rows; }, async latestAward() { return null; },
       }) };
@@ -226,10 +242,11 @@ test("blank posts cannot create checkout sessions", async () => {
   assert.equal(h.checkoutCalls.length, 0);
 });
 
-test("migration marks only the two approved demos and preserves original payment amounts", async () => {
+test("migration publishes the owner's demo as complimentary and preserves payment history", async () => {
   const other = { id: 5, body: "A real purchase", handle: "someone", amount_pence: 300, stripe_session: "cs_other" };
   const h = await harness([...demos, other]);
-  assert.deepEqual(h.rows.map((row) => row.is_demo), [true, true, false]);
+  assert.deepEqual(h.rows.map((row) => row.is_demo), [false, true, false]);
+  assert.deepEqual(h.rows.map((row) => row.is_complimentary), [true, false, false]);
   assert.deepEqual(h.rows.map((row) => row.amount_pence), [300, 300, 300]);
   assert.deepEqual(h.rows.map((row) => row.currency), ["gbp", "gbp", "gbp"]);
   assert.deepEqual(h.rows.map((row) => row.stripe_session), ["cs_demo_one", "cs_demo_two", "cs_other"]);
@@ -245,13 +262,16 @@ test("migration rolls back and prevents startup on failure", async () => {
   assert.equal(h.exitCode, 1);
 });
 
-test("the retained demo displays USD 1 and the paid headline starts at USD 0", async () => {
+test("the owner's live post contributes USD 1 to the public total without demo language", async () => {
   const h = await harness(demos);
   const html = await h.page();
-  assert.match(html, /class="total">\$0<\/span>/);
-  assert.equal((html.match(/class="badge">demo<\/span>/g) || []).length, 1);
+  assert.match(html, /class="total">\$1<\/span>/);
+  assert.equal((html.match(/class="badge">demo<\/span>/g) || []).length, 0);
   assert.equal((html.match(/class="amount">\$1<\/span>/g) || []).length, 1);
-  assert.match(html, /not included in the paid total/);
+  assert(!html.includes("Demo posts are examples"));
+  assert(!html.includes("Example confession"));
+  assert.match(html, /data-react-id="3"/);
+  assert.match(html, /href="\/confessions\/3"/);
   assert(!html.includes("£3"));
 });
 
@@ -286,7 +306,7 @@ test("new USD payments and older GBP payments retain their own currency and sepa
   assert.equal(h.rows[2].currency, "usd");
   assert.equal(h.rows[3].currency, "gbp");
   const html = await h.page();
-  assert.match(html, /class="total">\$1<\/span>/);
+  assert.match(html, /class="total">\$2<\/span>/);
   assert.match(html, /Earlier purchases in other currencies: £3/);
 });
 
@@ -295,7 +315,28 @@ test("replayed webhook deliveries do not duplicate posts or inflate the total", 
   await h.webhook("checkout.session.completed", paid("cs_repeat"));
   await h.webhook("checkout.session.completed", paid("cs_repeat"));
   assert.equal(h.rows.length, 3);
-  assert.match(await h.page(), /class="total">\$1<\/span>/);
+  assert.match(await h.page(), /class="total">\$2<\/span>/);
+});
+
+test("the converted owner confession has the normal permalink, social preview and downloadable card", async () => {
+  const h = await harness(demos);
+  const page = await h.get("/confessions/:id", { params: { id: "3" } });
+  assert.equal(page.code, 200);
+  assert.match(page.body, /Confession #0003/);
+  assert.match(page.body, /card.png\?v=2/);
+  assert(!page.body.includes("Example confession"));
+  assert.match(page.body, /Share on X/);
+  assert.match(page.body, /data-url="https:\/\/example.invalid\/confessions\/3"/);
+  assert.match(page.body, /href="\/confessions\/3\/card.png\?download=1"/);
+  const { cardSvg } = require("../lib/cards");
+  const svg = cardSvg(h.rows[0]);
+  assert.match(svg, /CONFESSION #0003/);
+  assert(!svg.includes("EXAMPLE CONFESSION"));
+  const png = await h.get("/confessions/:id/card.png", { params: { id: "3" }, query: { download: "1" } });
+  assert.equal(png.code, 200);
+  assert.equal(png.body.readUInt32BE(16), 1200);
+  assert.equal(png.body.readUInt32BE(20), 630);
+  assert.equal(h.checkoutCalls.length, 0);
 });
 
 test("unpaid checkouts remain unpublished until a delayed success arrives", async () => {
